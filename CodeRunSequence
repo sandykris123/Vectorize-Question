@@ -1,0 +1,21 @@
+# Create a new directory for your project
+mkdir couchbase-vector-search-chatbot
+cd couchbase-vector-search-chatbot
+
+# Copy the files into this directory
+# (Place README.md, requirements.txt, and hotel_review_chatbot.py here)
+
+# Initialize git repository
+git init
+
+# Add files
+git add .
+
+# Commit
+git commit -m "Initial commit: Couchbase Vector Search Chatbot"
+
+# Add your GitHub repo as remote
+git remote add origin https://github.com/yourusername/couchbase-vector-search-chatbot.git
+
+# Push to GitHub
+git push -u origin main
