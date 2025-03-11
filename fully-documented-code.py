@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Hotel Review Vector Search Chatbot
-
-This application demonstrates the use of Couchbase's vector search capabilities
-to build a simple chatbot that finds relevant hotel reviews based on user queries.
-It uses semantic similarity via embeddings to match natural language queries
-with review content.
-
-Author: Your Name
-License: MIT
-"""
-
 # Import required libraries
 from sentence_transformers import SentenceTransformer
 from couchbase.cluster import Cluster
@@ -22,11 +9,9 @@ from couchbase.options import SearchOptions, ClusterTimeoutOptions
 from couchbase.vector_search import VectorQuery, VectorSearch
 import os
 import sys
-import json
 from datetime import timedelta
-import traceback
 
-# Print SDK version for debugging
+# Print SDK version
 import couchbase
 print(f"Couchbase Python SDK Version: {couchbase.__version__}")
 
@@ -41,19 +26,20 @@ CB_HOSTNAME = "cb.0pjzyc2efdadlu6.cloud.couchbase.com"
 CB_BUCKET = "travel-sample"
 CB_SCOPE = "inventory"
 CB_COLLECTION_TARGET = "reviewvector"
-# Vector search index name
-VECTOR_INDEX_NAME = "review_vector_idx"
+# Vector search index name - just use the base name without bucket/scope prefix
+VECTOR_INDEX_NAME = "rv_idx"  # Changed from "travel-sample.inventory.rv_idx"
 
 # Path to the Capella certificate file
-CERT_PATH = "/path/to/certificate.pem"  # Update this path
+CERT_PATH = "/Users/sandhya.krishnamurthy/Downloads/AIchatbot/AIDEMOCLUSTER-root-certificate.pem"
 
+# Check if certificate exists
+if not os.path.exists(CERT_PATH):
+    print(f"Error: Capella certificate file not found at {CERT_PATH}")
+    print("Download your certificate from Capella dashboard and update the CERT_PATH")
+    sys.exit(1)
+
+# Function to connect to Couchbase Capella
 def connect_to_capella():
-    """
-    Establishes a connection to Couchbase Capella cluster.
-    
-    Returns:
-        Cluster: A connected Couchbase cluster object or None if connection fails
-    """
     print(f"Connecting to Couchbase Capella at {CB_HOSTNAME}...")
     try:
         # For Capella, we must use secure connections
@@ -80,7 +66,6 @@ def connect_to_capella():
         # Test connection
         ping_result = cluster.ping()
         print("Successfully connected to Couchbase Capella")
-        print(f"Ping result: {ping_result}")
         return cluster
     except Exception as e:
         print(f"Connection error: {e}")
@@ -89,377 +74,192 @@ def connect_to_capella():
         print("2. Check that your Capella endpoint URL is correct")
         print("3. Ensure your certificate file is valid and in the correct location")
         print("4. Check that your IP address is allowed in Capella's allowed IP list")
-        traceback.print_exc()
-        return None
+        sys.exit(1)
 
-def check_vector_search_index(cluster):
-    """
-    Checks if the required vector search index exists in the cluster.
-    
-    Args:
-        cluster (Cluster): Connected Couchbase cluster
-        
-    Returns:
-        bool: True if the index exists, False otherwise
-    """
+# Function to display available search indexes (informational only)
+def list_search_indexes(cluster):
     try:
         # Make sure cluster is not None
         if cluster is None:
             print("Error: cluster object is None")
-            return False
+            return
             
-        # Check if vector search index already exists using a safer approach
         try:
             # Try to get indexes using the Search API if available
             mgr = cluster.search_indexes()
             indexes = mgr.get_all_indexes()
-            index_exists = any(idx.name == VECTOR_INDEX_NAME for idx in indexes)
+            
+            print("\nAvailable search indexes:")
+            for idx in indexes:
+                print(f"  - {idx.name} (Bucket: {idx.bucket_name}, Scope: {idx.scope_name}, Collection: {idx.collection_name})")
+                
+            print(f"\nWe will use the index name '{VECTOR_INDEX_NAME}' for searches")
+            print(f"Make sure this index exists in bucket '{CB_BUCKET}', scope '{CB_SCOPE}'\n")
+            
         except Exception as se:
-            print(f"Search API not available, falling back to N1QL: {se}")
-            # Fallback to N1QL query
-            query = f"""
-            SELECT name 
-            FROM system:indexes 
-            WHERE keyspace_id = '{CB_BUCKET}' 
-              AND scope_id = '{CB_SCOPE}' 
-              AND bucket_id = '{CB_BUCKET}'
-              AND name = '{VECTOR_INDEX_NAME}'
-            """
-            result = list(cluster.query(query))
-            index_exists = len(result) > 0
-        
-        if not index_exists:
-            print(f"\nWARNING: Vector search index '{VECTOR_INDEX_NAME}' not found.")
-            print("To use vector search, you need to create a Search index with vector capabilities.")
-            print("You can create this through the Couchbase Web Console:")
-            print(f"1. Go to Search → Add Index")
-            print(f"2. Name the index '{VECTOR_INDEX_NAME}'")
-            print(f"3. Select bucket '{CB_BUCKET}', scope '{CB_SCOPE}', collection '{CB_COLLECTION_TARGET}'")
-            print(f"4. Add a vector mapping for the 'embedding' field with 384 dimensions")
-            print(f"5. Save and build the index\n")
-            return False
-        else:
-            print(f"Vector search index '{VECTOR_INDEX_NAME}' found.")
-            return True
+            print(f"Cannot list search indexes: {se}")
             
     except Exception as e:
-        print(f"Error checking vector search index: {e}")
+        print(f"Error listing search indexes: {e}")
+        import traceback
         traceback.print_exc()
-        return False
 
-def fallback_to_n1ql(cluster, query_embedding, top_k=5):
-    """
-    Performs vector search using N1QL with vector functions as a fallback method.
-    
-    Args:
-        cluster (Cluster): Connected Couchbase cluster
-        query_embedding (list): Vector embedding of the user query
-        top_k (int): Number of results to return
-        
-    Returns:
-        list: List of search results with similarity scores
-    """
-    print("Using N1QL query with vector functions as fallback")
-    try:
-        # Use a N1QL query with vector functions which works across SDK versions
-        vector_query = f"""
-        SELECT meta().id as doc_id, hotel_name, review_content, review_author, review_date, review_ratings,
-               VECTOR_DISTANCE(embedding, $query_vector) AS distance_score
-        FROM `{CB_BUCKET}`.`{CB_SCOPE}`.`{CB_COLLECTION_TARGET}`
-        WHERE embedding IS NOT NULL
-        ORDER BY VECTOR_DISTANCE(embedding, $query_vector)
-        LIMIT {top_k}
-        """
-        
-        # Execute the query with parameter binding for the vector
-        print("Executing vector search via N1QL query...")
-        result = cluster.query(
-            vector_query,
-            query_context=f'default:`{CB_BUCKET}`.`{CB_SCOPE}`',
-            parameters={'query_vector': query_embedding}
-        )
-        
-        # Process results
-        scored_results = []
-        for row in result:
-            # Calculate similarity score (1 - distance)
-            # Assuming distance is normalized between 0-1
-            distance = row.get('distance_score', 0)
-            similarity = 1 - distance
-            
-            result_item = {
-                "hotel_name": row.get("hotel_name", "Unknown Hotel"),
-                "review_content": row.get("review_content", "No content available"),
-                "review_author": row.get("review_author", "Anonymous"),
-                "review_date": row.get("review_date", "Unknown date"),
-                "similarity_score": f"{similarity:.2f}",
-                "ratings": row.get("review_ratings", {})
-            }
-            scored_results.append(result_item)
-        
-        print(f"Found {len(scored_results)} relevant documents using N1QL query")
-        return scored_results
-    except Exception as e:
-        print(f"N1QL fallback failed: {e}")
-        traceback.print_exc()
-        return []
-
-def fallback_search(user_input, top_k=5):
-    """
-    Basic fallback search method that retrieves documents when vector search is unavailable.
-    
-    Args:
-        user_input (str): User's query text
-        top_k (int): Number of results to return
-        
-    Returns:
-        list: List of search results (without similarity scores)
-    """
-    try:
-        # Connect to Couchbase
-        cluster = connect_to_capella()
-        bucket = cluster.bucket(CB_BUCKET)
-        scope = bucket.scope(CB_SCOPE)
-        collection = scope.collection(CB_COLLECTION_TARGET)
-        
-        # Simple N1QL query to get some documents
-        query = f"""
-        SELECT META().id as doc_id
-        FROM `{CB_BUCKET}`.`{CB_SCOPE}`.`{CB_COLLECTION_TARGET}`
-        LIMIT {top_k}
-        """
-        result = cluster.query(query)
-        
-        # Get documents using KV operations
-        scored_results = []
-        for row in result:
-            doc_id = row["doc_id"]
-            try:
-                # Get the document with more detailed error handling
-                get_result = collection.get(doc_id)
-                
-                # Handle different SDK versions - some use result.content, others use result.value
-                doc = None
-                if hasattr(get_result, 'content'):
-                    doc = get_result.content
-                elif hasattr(get_result, 'value'):
-                    doc = get_result.value
-                else:
-                    print(f"Debug: GetResult attributes: {dir(get_result)}")
-                    # Try to get the document content in any available way
-                    for attr in dir(get_result):
-                        if attr.startswith('_') or attr in ('id', 'cas', 'flags', 'expiry'):
-                            continue
-                        try:
-                            val = getattr(get_result, attr)
-                            if isinstance(val, dict) and not callable(val):
-                                print(f"Using attribute {attr} as document content")
-                                doc = val
-                                break
-                        except:
-                            pass
-                
-                if doc is None:
-                    print(f"Could not extract document content from GetResult for {doc_id}")
-                    continue
-                
-                # Add to results with a placeholder similarity score
-                result_item = {
-                    "hotel_name": doc.get("hotel_name", "Unknown Hotel"),
-                    "review_content": doc.get("review_content", "No content available"),
-                    "review_author": doc.get("review_author", "Anonymous"),
-                    "review_date": doc.get("review_date", "Unknown date"),
-                    "similarity_score": "N/A (fallback)",
-                    "ratings": doc.get("review_ratings", {})
-                }
-                scored_results.append(result_item)
-            except Exception as e:
-                print(f"Error retrieving document {doc_id}: {e}")
-                traceback.print_exc()
-                continue
-        
-        return scored_results
-    except Exception as e:
-        print(f"Fallback search also failed: {e}")
-        traceback.print_exc()
-        return [{"error": f"Search failed: {str(e)}"}]
-
+# Function to perform vector search
 def perform_vector_search(user_input, top_k=5):
-    """
-    Performs vector search using Couchbase's native vector search capabilities.
-    Includes fallback mechanisms for different SDK versions and environments.
-    
-    Args:
-        user_input (str): User's query text
-        top_k (int): Number of top results to return
-        
-    Returns:
-        list: List of search results with similarity scores
-    """
     try:
         # Connect to Couchbase
         cluster = connect_to_capella()
         if cluster is None:
             print("Error: Failed to connect to Couchbase")
-            return fallback_search(user_input, top_k)
-            
-        # Check if index exists
-        if not check_vector_search_index(cluster):
-            print("Warning: Vector search index not found, falling back to basic search")
-            return fallback_search(user_input, top_k)
+            return []
             
         bucket = cluster.bucket(CB_BUCKET)
         scope = bucket.scope(CB_SCOPE)
+        collection = scope.collection(CB_COLLECTION_TARGET)
         
         # Generate embedding for the user input
         query_embedding = model.encode(user_input).tolist()
         
-        print("Executing vector search using Search API...")
-        
-        # Debug the search capabilities
-        print("Available search module attributes:", dir(search))
+        print("Attempting vector search using Search API...")
         
         try:
-            # First attempt with the approach from the example
             # Create a search request with vector search component
             search_req = search.SearchRequest.create(search.MatchNoneQuery()).with_vector_search(
                 VectorSearch.from_vector_query(VectorQuery('embedding', query_embedding, num_candidates=100))
             )
             
-            # Execute the search
+            # Execute the search directly on the scope
             result = scope.search(
-                VECTOR_INDEX_NAME, 
-                search_req, 
+                VECTOR_INDEX_NAME,  # Use just the index name without bucket.scope prefix
+                search_req,
                 SearchOptions(
                     limit=top_k,
                     fields=["hotel_name", "review_content", "review_author", "review_date", "review_ratings"]
                 )
             )
-        except AttributeError as ae:
-            print(f"Search API method not found: {ae}")
-            print("Trying alternative search approach...")
+        except Exception as e:
+            print(f"Search API error with SearchRequest: {e}")
+            print("Trying alternative direct vector search...")
             
-            # Alternative approach for older SDKs
-            try:
-                # Try direct vector search if available
-                if hasattr(cluster, 'search_query'):
-                    vector_query = search.VectorQuery('embedding', query_embedding)
-                    result = cluster.search(VECTOR_INDEX_NAME, vector_query, 
-                              SearchOptions(limit=top_k, fields=["hotel_name", "review_content", "review_author", "review_date", "review_ratings"]))
-                else:
-                    # Fall back to N1QL with vector functions
-                    print("Search API not compatible, falling back to N1QL query")
-                    return fallback_to_n1ql(cluster, query_embedding, top_k)
-            except Exception as e2:
-                print(f"Alternative search approach failed: {e2}")
-                return fallback_search(user_input, top_k)
+            # Simplified alternative approach
+            vector_query = search.VectorQuery('embedding', query_embedding)
+            result = scope.search(
+                VECTOR_INDEX_NAME,
+                vector_query,
+                SearchOptions(
+                    limit=top_k,
+                    fields=["hotel_name", "review_content", "review_author", "review_date", "review_ratings"]
+                )
+            )
         
         # Process the results
         scored_results = []
-        try:
-            # Debug information
-            print(f"Result type: {type(result)}")
-            print(f"Result attributes: {dir(result)}")
+        
+        # Print result info for debugging
+        print(f"Result type: {type(result)}")
+        if hasattr(result, '__dict__'):
+            print(f"Result __dict__: {result.__dict__}")
+        
+        # First try to use direct hits if available
+        if hasattr(result, 'hits') and isinstance(result.hits, list):
+            print(f"Found {len(result.hits)} hits directly in result.hits")
             
-            # Check if rows() method exists and is callable
-            if hasattr(result, 'rows') and callable(result.rows):
-                rows = result.rows()
-                print(f"Number of rows: {len(list(rows)) if rows else 0}")
-                
-                # Reset rows iterator (since we consumed it above)
-                rows = result.rows()
-                
-                for row in rows:
-                    if row is None:
-                        print("Warning: row is None, skipping")
-                        continue
-                        
-                    print(f"Row type: {type(row)}")
-                    print(f"Row attributes: {dir(row)}")
-                    
-                    # Check if fields() method exists and is callable
-                    if hasattr(row, 'fields') and callable(row.fields):
-                        fields = row.fields()
-                    else:
-                        print("Warning: row.fields() is not callable, trying alternative approaches")
-                        # Try alternative ways to get fields
-                        if hasattr(row, '_fields') and isinstance(row._fields, dict):
-                            fields = row._fields
-                        elif hasattr(row, 'value') and isinstance(row.value, dict):
-                            fields = row.value
-                        elif hasattr(row, 'data') and isinstance(row.data, dict):
-                            fields = row.data
-                        else:
-                            print("Cannot extract fields from row, skipping")
-                            continue
-                    
-                    # Calculate similarity score
-                    if hasattr(row, 'score') and callable(row.score):
-                        similarity = 1 - row.score()
-                    elif hasattr(row, '_score'):
-                        similarity = 1 - row._score
-                    else:
-                        similarity = 0
-                        print("Warning: could not get score from row")
+            for hit in result.hits:
+                if isinstance(hit, dict) and 'fields' in hit:
+                    fields = hit['fields']
+                    score = hit.get('score', 0)
                     
                     result_item = {
                         "hotel_name": fields.get("hotel_name", "Unknown Hotel"),
                         "review_content": fields.get("review_content", "No content available"),
                         "review_author": fields.get("review_author", "Anonymous"),
                         "review_date": fields.get("review_date", "Unknown date"),
-                        "similarity_score": f"{similarity:.2f}",
+                        "similarity_score": f"{1-score:.2f}",
                         "ratings": fields.get("review_ratings", {})
                     }
                     scored_results.append(result_item)
-            else:
-                print("Warning: result.rows() is not callable, trying alternative approaches")
-                # Try to extract results directly from the result object
-                if hasattr(result, 'hits') and isinstance(result.hits, list):
-                    for hit in result.hits:
-                        fields = hit.get('fields', {})
-                        similarity = 1 - hit.get('score', 0)
-                        
-                        result_item = {
-                            "hotel_name": fields.get("hotel_name", "Unknown Hotel"),
-                            "review_content": fields.get("review_content", "No content available"),
-                            "review_author": fields.get("review_author", "Anonymous"),
-                            "review_date": fields.get("review_date", "Unknown date"),
-                            "similarity_score": f"{similarity:.2f}",
-                            "ratings": fields.get("review_ratings", {})
-                        }
-                        scored_results.append(result_item)
-                else:
-                    print("Could not extract results from search response")
-                    raise ValueError("No compatible methods found to extract search results")
+            
+            if scored_results:
+                print(f"Successfully extracted {len(scored_results)} results from hits")
+                return scored_results
+        
+        # If no hits, use the regular rows method but fetch documents with KV
+        try:
+            # Get rows from the result
+            rows = list(result.rows())
+            print(f"Successfully collected {len(rows)} rows")
+            
+            # Process each row by fetching the document
+            for row in rows:
+                print(f"Processing row ID: {row.id}")
+                
+                # Get the document ID from the row
+                doc_id = row.id
+                
+                # Fetch the actual document using the ID
+                try:
+                    # Get document from collection
+                    doc_result = collection.get(doc_id)
+                    doc_content = doc_result.content_as[dict]
                     
+                    # Create result item from the document content
+                    result_item = {
+                        "hotel_name": doc_content.get("hotel_name", "Unknown Hotel"),
+                        "review_content": doc_content.get("review_content", "No content available"),
+                        "review_author": doc_content.get("review_author", "Anonymous"),
+                        "review_date": doc_content.get("review_date", "Unknown date"),
+                        "similarity_score": f"{1-row.score:.2f}",
+                        "ratings": doc_content.get("review_ratings", {})
+                    }
+                    scored_results.append(result_item)
+                    print(f"Successfully processed document: {doc_id}")
+                    
+                except Exception as doc_ex:
+                    print(f"Error fetching document {doc_id}: {doc_ex}")
+                    print("Trying an alternative approach...")
+                    
+                    # If we can't get the document directly, try a N1QL query as fallback
+                    try:
+                        query = f'SELECT hotel_name, review_content, review_author, review_date, review_ratings FROM `{CB_BUCKET}`.`{CB_SCOPE}`.`{CB_COLLECTION_TARGET}` WHERE META().id = "{doc_id}"'
+                        query_result = cluster.query(query)
+                        
+                        # Check if we got results
+                        rows_list = list(query_result)
+                        if rows_list:
+                            doc_content = rows_list[0]
+                            
+                            result_item = {
+                                "hotel_name": doc_content.get("hotel_name", "Unknown Hotel"),
+                                "review_content": doc_content.get("review_content", "No content available"),
+                                "review_author": doc_content.get("review_author", "Anonymous"),
+                                "review_date": doc_content.get("review_date", "Unknown date"),
+                                "similarity_score": f"{1-row.score:.2f}",
+                                "ratings": doc_content.get("review_ratings", {})
+                            }
+                            scored_results.append(result_item)
+                            print(f"Successfully processed document using N1QL: {doc_id}")
+                    except Exception as query_ex:
+                        print(f"Error fetching document with N1QL: {query_ex}")
+        
         except Exception as e:
             print(f"Error processing search results: {e}")
+            import traceback
             traceback.print_exc()
-            
-        print(f"Found {len(scored_results)} relevant documents")
+        
+        # Return the results
+        print(f"Returning {len(scored_results)} results")
         return scored_results
     
-    except Exception as e:
-        print(f"Error performing vector search: {e}")
+    except CouchbaseException as ex:
+        print(f"Error performing vector search: {ex}")
+        import traceback
         traceback.print_exc()
-        
-        # Fallback to a basic KV operation approach if vector search fails
-        print("Attempting fallback approach with basic document retrieval...")
-        return fallback_search(user_input, top_k)
+        return []
 
+# Function to display search results
 def display_results(results):
-    """
-    Formats and displays search results to the user.
-    
-    Args:
-        results (list): List of search result items
-    """
     if not results:
         print("No relevant reviews found.")
-        return
-    
-    if "error" in results[0]:
-        print(f"Error: {results[0]['error']}")
         return
     
     print("\n" + "="*80)
@@ -479,11 +279,8 @@ def display_results(results):
         
         print("-"*80)
 
+# Main function to run the CLI chatbot
 def main():
-    """
-    Main function to run the CLI chatbot.
-    Handles user input, vector search, and result display.
-    """
     try:
         # Print SDK version for debugging
         import couchbase
@@ -497,6 +294,10 @@ def main():
             return
             
         print("Connection test successful!")
+        
+        # Display available search indexes
+        list_search_indexes(cluster)
+        
         print("\nWelcome to the Hotel Review Chatbot!")
         print("Ask questions about hotel experiences, and I'll find the most relevant reviews!")
         print("Type 'exit' or 'quit' to end the session.\n")
@@ -525,6 +326,7 @@ def main():
         print("\nSession terminated by user. Goodbye!")
     except Exception as e:
         print(f"\nAn error occurred: {e}")
+        import traceback
         traceback.print_exc()
 
 if __name__ == "__main__":
