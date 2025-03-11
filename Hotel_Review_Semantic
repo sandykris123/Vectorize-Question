@@ -1,0 +1,324 @@
+# Import required libraries
+from sentence_transformers import SentenceTransformer
+from couchbase.cluster import Cluster
+from couchbase.options import ClusterOptions
+from couchbase.auth import PasswordAuthenticator
+from couchbase.exceptions import CouchbaseException
+import couchbase.search as search
+from couchbase.options import SearchOptions, ClusterTimeoutOptions
+from couchbase.vector_search import VectorQuery, VectorSearch
+import os
+import sys
+from datetime import timedelta
+
+# Print SDK version
+import couchbase
+print(f"Couchbase Python SDK Version: {couchbase.__version__}")
+
+# Load the sentence transformer model - use the same model as the embedding creation
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Couchbase Capella connection parameters
+# Using environment variables for security or defaults
+CB_USERNAME = os.getenv("CB_USERNAME", "Administrator")
+CB_PASSWORD = os.getenv("CB_PASSWORD", "Password1!")
+CB_HOSTNAME = os.getenv("CB_HOSTNAME", "cb.0pjzyc2efdadlu6.cloud.couchbase.com")
+CB_BUCKET = os.getenv("CB_BUCKET", "travel-sample")
+CB_SCOPE = os.getenv("CB_SCOPE", "inventory")
+CB_COLLECTION_TARGET = os.getenv("CB_COLLECTION", "reviewvector")
+VECTOR_INDEX_NAME = os.getenv("VECTOR_INDEX", "rv_idx")
+VECTOR_FIELD = os.getenv("VECTOR_FIELD", "embedding")
+
+# Path to the Capella certificate file
+CERT_PATH = os.getenv("CERT_PATH", "/Users/sandhya.krishnamurthy/Downloads/AIchatbot/AIDEMOCLUSTER-root-certificate.pem")
+
+# Check if certificate exists (if not using ssl=no_verify)
+if os.getenv("USE_CERT", "true").lower() == "true" and not os.path.exists(CERT_PATH):
+    print(f"Error: Capella certificate file not found at {CERT_PATH}")
+    print("Download your certificate from Capella dashboard and update the CERT_PATH")
+    sys.exit(1)
+
+# Function to connect to Couchbase Capella
+def connect_to_capella():
+    print(f"Connecting to Couchbase Capella at {CB_HOSTNAME}...")
+    try:
+        # Determine connection string based on whether to verify SSL
+        use_cert = os.getenv("USE_CERT", "true").lower() == "true"
+        if use_cert:
+            connection_string = f"couchbases://{CB_HOSTNAME}"
+        else:
+            connection_string = f"couchbases://{CB_HOSTNAME}/?ssl=no_verify"
+        
+        # Set up authenticator with Capella credentials
+        auth = PasswordAuthenticator(CB_USERNAME, CB_PASSWORD)
+        
+        # Configure timeout options
+        timeout_opts = ClusterTimeoutOptions(
+            kv_timeout=timedelta(seconds=30),
+            query_timeout=timedelta(seconds=75)
+        )
+        
+        # Create cluster options with timeout options
+        options = ClusterOptions(auth, timeout_options=timeout_opts)
+        
+        # Set certificate path for TLS/SSL connections if using certificate
+        if use_cert:
+            options.ssl_cert = CERT_PATH
+        
+        # Connect to the cluster
+        cluster = Cluster(connection_string, options)
+        
+        # Test connection
+        ping_result = cluster.ping()
+        print("Successfully connected to Couchbase Capella")
+        return cluster
+    except Exception as e:
+        print(f"Connection error: {e}")
+        print("\nTroubleshooting steps:")
+        print("1. Verify your Capella username and password are correct")
+        print("2. Check that your Capella endpoint URL is correct")
+        print("3. Ensure your certificate file is valid (if using certificates)")
+        print("4. Check that your IP address is allowed in Capella's allowed IP list")
+        sys.exit(1)
+
+# Function to display available search indexes
+def list_search_indexes(cluster):
+    try:
+        # Make sure cluster is not None
+        if cluster is None:
+            print("Error: cluster object is None")
+            return
+            
+        try:
+            # Try to get indexes using the Search API if available
+            mgr = cluster.search_indexes()
+            indexes = mgr.get_all_indexes()
+            
+            print("\nAvailable search indexes:")
+            for idx in indexes:
+                print(f"  - {idx.name} (Bucket: {idx.bucket_name}, Scope: {idx.scope_name}, Collection: {idx.collection_name})")
+                
+            print(f"\nWe will use the index name '{VECTOR_INDEX_NAME}' for searches")
+            
+        except Exception as se:
+            print(f"Cannot list search indexes: {se}")
+            
+    except Exception as e:
+        print(f"Error listing search indexes: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Function to perform vector search
+def perform_vector_search(user_input, top_k=5):
+    try:
+        # Connect to Couchbase
+        cluster = connect_to_capella()
+        if cluster is None:
+            print("Error: Failed to connect to Couchbase")
+            return []
+            
+        bucket = cluster.bucket(CB_BUCKET)
+        scope = bucket.scope(CB_SCOPE)
+        collection = scope.collection(CB_COLLECTION_TARGET)
+        
+        # Generate embedding for the user input using SentenceTransformers
+        print("Generating embedding for query...")
+        query_embedding = model.encode(user_input).tolist()
+        
+        print("Performing vector search...")
+        
+        try:
+            # Create a search request with vector search component
+            search_req = search.SearchRequest.create(search.MatchNoneQuery()).with_vector_search(
+                VectorSearch.from_vector_query(VectorQuery(VECTOR_FIELD, query_embedding, num_candidates=100))
+            )
+            
+            # Define the fields to return - adjust based on your collection schema
+            field_list = ["hotel_name", "review_content", "review_author", "review_date", "review_ratings"]
+            
+            # Execute the search on the scope
+            result = scope.search(
+                VECTOR_INDEX_NAME,
+                search_req,
+                SearchOptions(limit=top_k, fields=field_list)
+            )
+            
+        except Exception as e:
+            print(f"Search API error with SearchRequest: {e}")
+            print("Trying alternative direct vector search...")
+            
+            # Try direct vector query as fallback
+            vector_query = search.VectorQuery(VECTOR_FIELD, query_embedding)
+            result = scope.search(
+                VECTOR_INDEX_NAME,
+                vector_query,
+                SearchOptions(limit=top_k, fields=field_list)
+            )
+        
+        # Process the results
+        scored_results = []
+        
+        # Print result metadata for debugging
+        print(f"Result type: {type(result)}")
+        
+        # Get rows from the result
+        rows = list(result.rows())
+        print(f"Successfully collected {len(rows)} rows")
+        
+        # Process each row
+        for row in rows:
+            print(f"Processing row ID: {row.id}")
+            
+            # First try to get fields from row if available
+            fields = None
+            if hasattr(row, 'fields') and callable(getattr(row, 'fields')):
+                try:
+                    fields = row.fields()
+                except Exception:
+                    fields = None
+            
+            # If we got fields from the search result, use them
+            if fields:
+                result_item = {
+                    "id": row.id,
+                    "similarity_score": f"{1-row.score:.2f}"
+                }
+                
+                # Add all returned fields
+                for field in field_list:
+                    result_item[field] = fields.get(field, "Not available")
+                
+                scored_results.append(result_item)
+                print(f"Successfully used search fields for: {row.id}")
+            else:
+                # Otherwise, fetch the document using Key-Value operation
+                try:
+                    # Get document from collection
+                    doc_result = collection.get(row.id)
+                    doc_content = doc_result.content_as[dict]
+                    
+                    # Create result item from the document content
+                    result_item = {
+                        "id": row.id,
+                        "similarity_score": f"{1-row.score:.2f}"
+                    }
+                    
+                    # Add fields from document
+                    for field in field_list:
+                        result_item[field] = doc_content.get(field, "Not available")
+                    
+                    scored_results.append(result_item)
+                    print(f"Successfully processed document: {row.id}")
+                    
+                except Exception as doc_ex:
+                    print(f"Error fetching document {row.id}: {doc_ex}")
+                    print("Trying N1QL query as a last resort...")
+                    
+                    # Try N1QL query as a last resort
+                    try:
+                        query = f'SELECT hotel_name, review_content, review_author, review_date, review_ratings FROM `{CB_BUCKET}`.`{CB_SCOPE}`.`{CB_COLLECTION_TARGET}` WHERE META().id = "{row.id}"'
+                        query_result = cluster.query(query)
+                        
+                        rows_list = list(query_result)
+                        if rows_list:
+                            doc_content = rows_list[0]
+                            
+                            result_item = {
+                                "id": row.id,
+                                "similarity_score": f"{1-row.score:.2f}"
+                            }
+                            
+                            # Add fields from document
+                            for field in field_list:
+                                result_item[field] = doc_content.get(field, "Not available")
+                            
+                            scored_results.append(result_item)
+                            print(f"Successfully retrieved using N1QL: {row.id}")
+                    except Exception as query_ex:
+                        print(f"Failed to retrieve document using N1QL: {query_ex}")
+        
+        # Return the results
+        print(f"Returning {len(scored_results)} results")
+        return scored_results
+    
+    except CouchbaseException as ex:
+        print(f"Error performing vector search: {ex}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+# Function to display search results
+def display_results(results, query):
+    if not results:
+        print("No relevant results found.")
+        return
+    
+    print("\n" + "="*80)
+    print(f"Found {len(results)} relevant results for query: '{query}'\n")
+    
+    for i, result in enumerate(results, 1):
+        print(f"Result {i} (Similarity: {result['similarity_score']})")
+        
+        # Print all available fields
+        for key, value in result.items():
+            if key not in ['id', 'similarity_score']:
+                if isinstance(value, dict):
+                    print(f"{key.title()}:")
+                    for sub_key, sub_value in value.items():
+                        print(f"  - {sub_key}: {sub_value}")
+                else:
+                    print(f"{key.title()}: {value}")
+        
+        print("-"*80)
+
+# Main function
+def main():
+    try:
+        # Print SDK version for debugging
+        print(f"Couchbase Python SDK Version: {couchbase.__version__}")
+        
+        # Test connection first
+        print("Testing connection to Couchbase...")
+        cluster = connect_to_capella()
+        if cluster is None:
+            print("Error: Failed to connect to Couchbase")
+            return
+            
+        print("Connection test successful!")
+        
+        # Display available search indexes
+        list_search_indexes(cluster)
+        
+        print("\nWelcome to the Vector Search Demo!")
+        print("Ask questions, and I'll find the most relevant results using vector search!")
+        print("Type 'exit' or 'quit' to end the session.\n")
+        
+        while True:
+            # Get user input
+            user_input = input("\nYour question: ")
+            
+            # Check if user wants to exit
+            if user_input.lower() in ["exit", "quit", "q"]:
+                print("Thank you for using the Vector Search Demo. Goodbye!")
+                break
+            
+            if not user_input.strip():
+                print("Please enter a question or topic.")
+                continue
+            
+            # Perform vector search
+            print("Performing vector search...")
+            search_results = perform_vector_search(user_input)
+            
+            # Display results
+            display_results(search_results, user_input)
+            
+    except KeyboardInterrupt:
+        print("\nSession terminated by user. Goodbye!")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
